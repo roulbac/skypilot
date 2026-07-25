@@ -290,6 +290,32 @@ server on ``sky.corp.example.com`` and services on ``*.skyapps.io``. SkyPilot
 refuses to emit hostnames when the two share a registrable domain, unless
 ``allow_shared_parent_domain: true`` is set.
 
+If a second registrable domain is not available, the safe way to run services
+under a subdomain of the API server's domain is to register *that subdomain*
+in the Public Suffix List's private section -- the same mechanism behind
+``github.io``. Once ``serve.example.com`` is a PSL entry, browsers treat it as
+a domain boundary in its own right: nothing can set a cookie scoped to it, and
+it becomes a separate *site*, so the API server keeps its ``SameSite``
+protections against requests from services. Set
+``allow_shared_parent_domain: true`` once the entry has landed.
+
+Note that this is the opposite of what a cookie-authenticated app wants --
+`Coder <https://coder.com/docs/admin/networking/wildcard-access-url>`_, for
+instance, warns against PSL-listed wildcard domains because its workspace
+proxy needs cookies to reach the subdomain. SkyServe services are untrusted
+workloads behind an external auth proxy, so cookies reaching them are pure
+downside.
+
+.. warning::
+
+    Registering the subdomain does **not** stop cookies scoped to the parent
+    (``Domain=.example.com``) from reaching services, and it does not stop a
+    service from setting such a cookie and having it sent to every other
+    application under that parent. If other tools share ``example.com``, they
+    inherit that exposure. Adding label depth does not help either: cookie
+    scope follows the registrable domain, so ``*.a.b.c.example.com`` is no
+    more isolated than ``*.serve.example.com``.
+
 **Register the wildcard domain with the Public Suffix List.** Distinct origins
 separate services' DOM, storage and XHR, but cookies do not follow the
 same-origin policy: one service can set a cookie scoped to ``.skyapps.io`` and
