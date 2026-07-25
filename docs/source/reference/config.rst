@@ -1611,6 +1611,45 @@ Can be one of:
 
 Default: ``loadbalancer``.
 
+.. _config-yaml-kubernetes-ingress:
+
+``kubernetes.ingress``
+~~~~~~~~~~~~~~~~~~~~~~
+
+Wildcard subdomain hostnames for SkyServe endpoints under
+``kubernetes.ports: ingress`` (optional, experimental).
+
+When ``wildcard_domain`` is set, each SkyServe service is served at the root
+path of its own hostname under that domain, instead of under the
+``/skypilot/{namespace}/{cluster}/{port}`` sub-path. Unset by default, in which
+case behavior is unchanged. Cluster ports (``sky launch --ports``) are
+unaffected.
+
+These keys are admin-only: they are honored exclusively from the API server's
+own config and are ignored (with a warning) if set in a client's
+``~/.sky/config.yaml``.
+
+.. code-block:: yaml
+
+  kubernetes:
+    ports: ingress
+    ingress:
+      # Domain serving user workloads. Must not share a registrable domain
+      # with the API server host. Unset (default) disables the feature.
+      wildcard_domain: skyapps.io
+
+      tls:
+        # none | external | secret. See the security notes linked below.
+        mode: external
+
+      auth:
+        url: https://auth.example.com/oauth2/auth
+        signin_url: https://auth.example.com/oauth2/start
+
+See :ref:`kubernetes-wildcard-subdomains` for the full option reference and the
+security requirements that apply before enabling this on a multi-tenant
+deployment.
+
 .. _config-yaml-kubernetes-remote-identity:
 
 ``kubernetes.remote_identity``

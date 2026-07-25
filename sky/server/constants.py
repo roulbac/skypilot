@@ -172,3 +172,9 @@ SERVER_HEARTBEAT_INTERVAL_SECONDS = 600  # 10 minutes
 # that leak (e.g., due to controller crash mid-cleanup) are eventually
 # removed once their TTL has passed.
 EXPIRED_TOKEN_CLEANUP_DAEMON_INTERVAL_SECONDS = 3600  # 1 hour
+
+# How often the SkyServe endpoint hostname reconciler re-derives the wildcard
+# Ingress from the live service table. This bounds the window in which a
+# torn-down service's hostname can still resolve, so it is deliberately short;
+# the reconcile is a no-op write when nothing has changed.
+SERVE_ENDPOINT_RECONCILE_DAEMON_INTERVAL_SECONDS = 60

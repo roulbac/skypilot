@@ -14,8 +14,10 @@ import colorama
 import filelock
 
 from sky import backends
+from sky import clouds
 from sky import exceptions
 from sky import execution
+from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
@@ -23,6 +25,7 @@ from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.catalog import common as service_catalog_common
 from sky.data import storage as storage_lib
+from sky.provision.kubernetes import network as kubernetes_network
 from sky.serve import constants as serve_constants
 from sky.serve import runner as serve_runner
 from sky.serve import serve_rpc_utils
@@ -869,6 +872,28 @@ class _DefaultServiceStatusRunner:
         return service_records
 
 
+def _query_serve_endpoint_hosts(
+        handle: 'backends.CloudVmRayResourceHandle') -> Dict[str, str]:
+    """Returns {service name: endpoint URL} published by the reconciler.
+
+    Empty unless the controller runs on Kubernetes with wildcard subdomain
+    routing enabled. Never raises: the port-based endpoint remains valid.
+    """
+    try:
+        launched_resources = handle.launched_resources
+        cloud = (launched_resources.cloud
+                 if launched_resources is not None else None)
+        if cloud is None or not cloud.is_same_cloud(clouds.Kubernetes()):
+            return {}
+        config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+        return kubernetes_network.query_serve_endpoints(
+            cluster_name_on_cloud=handle.cluster_name_on_cloud,
+            provider_config=config['provider'])
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Could not read SkyServe endpoint hostnames: {e}')
+        return {}
+
+
 def status(
     service_names: Optional[Union[str, List[str]]] = None,
     pool: bool = False,
@@ -897,6 +922,12 @@ def status(
     service_records = serve_runner.current().get_service_status(
         handle=handle, service_names=service_names, pool=pool)
 
+    # Service-named wildcard hostnames, when the SkyServe endpoint reconciler
+    # has published them. Empty unless wildcard subdomain routing is enabled.
+    serve_hosts: Dict[str, str] = {}
+    if not pool and not serve_utils.is_consolidation_mode(pool):
+        serve_hosts = _query_serve_endpoint_hosts(handle)
+
     # Get the endpoint for each service
     for service_record in service_records:
         service_record['endpoint'] = None
@@ -906,7 +937,14 @@ def status(
         if service_record['load_balancer_port'] is not None:
             try:
                 lb_port = service_record['load_balancer_port']
-                if not serve_utils.is_consolidation_mode(pool):
+                endpoint: Optional[str]
+                serve_host = serve_hosts.get(service_record['name'])
+                if serve_host is not None:
+                    # Preferred: this hostname is keyed on the service itself,
+                    # so it cannot be inherited by whichever service later
+                    # takes this load balancer port.
+                    endpoint = serve_host
+                elif not serve_utils.is_consolidation_mode(pool):
                     endpoint = backend_utils.get_endpoints(
                         cluster=common.SKY_SERVE_CONTROLLER_NAME,
                         port=lb_port).get(lb_port, None)
@@ -915,12 +953,20 @@ def status(
             except exceptions.ClusterNotUpError:
                 pass
             else:
-                protocol = ('https'
-                            if service_record['tls_encrypted'] else 'http')
                 if endpoint is not None:
-                    endpoint = endpoint.replace('https://',
-                                                '').replace('http://', '')
-                service_record['endpoint'] = f'{protocol}://{endpoint}'
+                    scheme, separator, rest = endpoint.partition('://')
+                    if not separator:
+                        # No scheme resolved by the infra layer (e.g. a raw
+                        # host:port from a LoadBalancer service).
+                        scheme, rest = 'http', endpoint
+                    if service_record['tls_encrypted']:
+                        # Service-level TLS always implies https. Otherwise
+                        # keep whatever the infra layer resolved, which may
+                        # already be https because TLS terminates at a
+                        # wildcard-subdomain ingress rather than in the
+                        # service itself.
+                        scheme = 'https'
+                    service_record['endpoint'] = f'{scheme}://{rest}'
 
     return service_records
 

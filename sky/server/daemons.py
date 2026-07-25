@@ -319,6 +319,88 @@ def should_skip_pool_status_refresh():
     return _should_skip_serve_status_refresh_event(pool=True)
 
 
+def _serve_controller_kubernetes_target():
+    """Returns (cluster_name_on_cloud, provider_config) for the controller.
+
+    Returns None when there is no reachable SkyServe controller, or when it is
+    not running on Kubernetes -- wildcard hostnames are an ingress-mode
+    concept and do not apply elsewhere.
+    """
+    # pylint: disable=import-outside-toplevel
+    from sky import backends
+    from sky import clouds
+    from sky import global_user_state
+    from sky.backends import backend_utils
+    from sky.utils import controller_utils
+
+    try:
+        handle = backend_utils.is_controller_accessible(
+            controller=controller_utils.Controllers.SKY_SERVE_CONTROLLER,
+            stopped_message='')
+    except Exception:  # pylint: disable=broad-except
+        # No controller, or it is down. Nothing to reconcile; the Ingress is
+        # removed along with the controller cluster by `cleanup_ports`.
+        return None
+    if not isinstance(handle, backends.CloudVmRayResourceHandle):
+        return None
+    launched_resources = handle.launched_resources
+    cloud = launched_resources.cloud if launched_resources is not None else None
+    if cloud is None or not cloud.is_same_cloud(clouds.Kubernetes()):
+        return None
+    config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+    return handle.cluster_name_on_cloud, config['provider']
+
+
+def serve_endpoint_reconcile_event():
+    """Reconciles SkyServe wildcard hostnames with the live service table.
+
+    Renders the whole SkyServe Ingress from the current set of services on
+    every pass, so a torn-down service loses its hostname without there being
+    an incremental delete path that could be missed. Runs out of band: a
+    failure here never affects `sky serve up`, it is just retried next pass.
+    """
+    # pylint: disable=import-outside-toplevel
+    from sky.provision.kubernetes import network as kubernetes_network
+    from sky.serve.server import impl as serve_impl
+
+    interval = skypilot_config.get_nested(
+        ('daemons', 'serve-endpoint-reconcile-daemon', 'interval_seconds'),
+        server_constants.SERVE_ENDPOINT_RECONCILE_DAEMON_INTERVAL_SECONDS)
+    try:
+        target = _serve_controller_kubernetes_target()
+        if target is None:
+            return
+        cluster_name_on_cloud, provider_config = target
+        service_to_port = {
+            record['name']: record['load_balancer_port']
+            for record in serve_impl.status(pool=False)
+            if record.get('load_balancer_port') is not None
+        }
+        hosts = kubernetes_network.reconcile_serve_endpoints(
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            service_to_port=service_to_port,
+            provider_config=provider_config)
+        logger.debug(f'Reconciled {len(hosts)} SkyServe endpoint hostname(s).')
+    except Exception as e:  # pylint: disable=broad-except
+        # Never let a reconcile failure take down the daemon; the next pass
+        # re-derives the desired state from scratch.
+        logger.warning(f'Failed to reconcile SkyServe endpoint hostnames: {e}')
+    finally:
+        time.sleep(interval)
+
+
+def should_skip_serve_endpoint_reconcile():
+    """Skip entirely unless wildcard subdomain routing is configured."""
+    # pylint: disable=import-outside-toplevel
+    from sky.provision.kubernetes import network_utils
+
+    try:
+        return network_utils.get_wildcard_ingress_config() is None
+    except Exception:  # pylint: disable=broad-except
+        # An invalid config means nothing was ever emitted; nothing to do.
+        return True
+
+
 def should_skip_server_heartbeat():
     """Skip server heartbeat when running as a controller."""
     if os.environ.get(constants.OVERRIDE_CONSOLIDATION_MODE) is not None:
@@ -397,6 +479,11 @@ INTERNAL_REQUEST_DAEMONS = [
         name=request_names.RequestName.REQUEST_DAEMON_POOL_STATUS_REFRESH,
         event_fn=pool_status_refresh_event,
         should_skip=should_skip_pool_status_refresh),
+    InternalRequestDaemon(
+        id='serve-endpoint-reconcile-daemon',
+        name=request_names.RequestName.REQUEST_DAEMON_SERVE_ENDPOINT_RECONCILE,
+        event_fn=serve_endpoint_reconcile_event,
+        should_skip=should_skip_serve_endpoint_reconcile),
     InternalRequestDaemon(
         id='server-heartbeat-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_SERVER_HEARTBEAT,

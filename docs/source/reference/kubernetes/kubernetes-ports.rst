@@ -173,4 +173,150 @@ Use :code:`sky status --endpoints <cluster>` to view the full endpoint URLs for 
 
 .. note::
 
-    When exposing a port under a sub-path such as an ingress, services expecting root path access, (e.g., Jupyter notebooks) may face issues. To resolve this, configure the service to operate under a different base URL. For Jupyter, use `--NotebookApp.base_url <https://jupyter-notebook.readthedocs.io/en/5.7.4/config.html>`_ flag during launch. Alternatively, consider using :ref:`LoadBalancer <kubernetes-loadbalancer>` mode.
+    When exposing a port under a sub-path such as an ingress, services expecting root path access, (e.g., Jupyter notebooks) may face issues. To resolve this, configure the service to operate under a different base URL. For Jupyter, use `--NotebookApp.base_url <https://jupyter-notebook.readthedocs.io/en/5.7.4/config.html>`_ flag during launch. Alternatively, consider using :ref:`LoadBalancer <kubernetes-loadbalancer>` mode. SkyServe services can instead be given root-path hostnames with the opt-in :ref:`wildcard subdomains <kubernetes-wildcard-subdomains>` below.
+
+.. _kubernetes-wildcard-subdomains:
+
+SkyServe wildcard subdomains (experimental)
+-------------------------------------------
+
+.. note::
+
+    Opt-in and off by default. When unset, SkyPilot's behavior is unchanged.
+    Read the security requirements below before enabling it on a multi-tenant
+    deployment.
+
+Sub-path endpoints break applications that expect to be served from the root
+path. With a wildcard domain configured, each SkyServe service is additionally
+served at the root of its own hostname:
+
+.. code-block::
+
+    $ sky serve status
+    SERVICE   VERSION  ENDPOINT
+    my-llm    1        https://my-llm--a1b2c3d4.skyapps.io
+
+Hostnames are keyed on the **service name**, not the load balancer port the
+service happens to occupy. This matters because SkyServe services share one
+controller and are assigned ports with ``find_free_port(30001)``: a port-keyed
+hostname would be inherited by whichever service next took that port. Keying on
+the service name means the hostname belongs to the service for as long as the
+service exists, and disappears with it.
+
+Cluster ports (``sky launch --ports``) continue to use sub-path endpoints.
+
+Prerequisites
+^^^^^^^^^^^^^
+
+1. A domain you control, dedicated to serving user workloads. It must **not**
+   share a registrable domain with your API server (see below).
+2. A wildcard DNS record ``*.skyapps.io`` pointing at the ingress controller's
+   external IP or hostname.
+3. A wildcard TLS certificate, terminated either upstream of the cluster (a
+   cloud load balancer with an ACM/Google-managed certificate, or a Gateway) or
+   by the ingress controller. Wildcard issuance requires a DNS-01 challenge.
+   Prefer one wildcard certificate over per-service certificates: per-host
+   certificates publish every service name to Certificate Transparency logs.
+
+Configuration
+^^^^^^^^^^^^^
+
+These keys are **admin-only**. They are honored exclusively from the API
+server's own config (``apiService.config`` in the Helm chart); a value set in a
+client's ``~/.sky/config.yaml`` is dropped with a warning.
+
+.. code-block:: yaml
+
+    kubernetes:
+      ports: ingress
+      ingress:
+        # Unset (the default) keeps sub-path endpoints only.
+        wildcard_domain: skyapps.io
+
+        tls:
+          # none     - no TLS at the ingress; endpoints are advertised as http://
+          # external - TLS terminated upstream (cloud LB, Gateway, mesh);
+          #            endpoints are advertised as https:// and no key enters
+          #            the cluster. Recommended.
+          # secret   - the ingress controller terminates TLS using a Secret.
+          #            See the warning below.
+          mode: external
+
+        # Put endpoints behind the same forward-auth service that fronts the
+        # API server. Required unless `allow_unauthenticated: true` is set.
+        auth:
+          url: https://auth.example.com/oauth2/auth
+          signin_url: https://auth.example.com/oauth2/start
+
+Hostnames have the form ``<service>--<8 hex>.<wildcard_domain>``. The separator
+is ``--`` rather than ``.`` so that a one-level ``*.<domain>`` certificate and
+DNS record are sufficient, and the hash is taken over the untruncated service
+identity so that truncating a long name cannot collide two services onto one
+hostname.
+
+How it stays in sync
+^^^^^^^^^^^^^^^^^^^^
+
+A reconciler on the API server re-derives the whole SkyServe Ingress from the
+live service table, so a removed service is simply absent from the next render
+-- there is no incremental delete step that can be missed and leave a route
+behind. Writes are skipped when nothing has changed, so the reconcile does not
+reload the ingress controller on every pass. The resolved hostnames are
+published on the Ingress as a ``skypilot.co/serve-endpoint-hosts`` annotation
+and read back from there, so changing the naming scheme in a future release
+cannot invalidate a running service's endpoint.
+
+.. note::
+
+    The reconcile runs periodically (default 60s, configurable via
+    ``daemons.serve-endpoint-reconcile-daemon.interval_seconds``). Between a
+    service being torn down and the next pass, its hostname can still resolve.
+
+.. _kubernetes-wildcard-subdomains-security:
+
+Security requirements
+^^^^^^^^^^^^^^^^^^^^^
+
+Under a wildcard domain, any user who can deploy a service can serve arbitrary
+JavaScript from a hostname under that domain. Sub-path endpoints never did
+this, so these requirements are new.
+
+**Use a separate registrable domain from the API server.** If the API server is
+at ``sky.example.com`` and services at ``*.serve.example.com``, a cookie scoped
+to ``Domain=.example.com`` -- which admins commonly configure to share
+oauth2-proxy sessions across tools -- is readable by every deployed service,
+which can then call the API server as that operator. Use, for example, the API
+server on ``sky.corp.example.com`` and services on ``*.skyapps.io``. SkyPilot
+refuses to emit hostnames when the two share a registrable domain, unless
+``allow_shared_parent_domain: true`` is set.
+
+**Register the wildcard domain with the Public Suffix List.** Distinct origins
+separate services' DOM, storage and XHR, but cookies do not follow the
+same-origin policy: one service can set a cookie scoped to ``.skyapps.io`` and
+another can read *or forge* it. PSL registration makes browsers refuse
+``Domain=`` cookies scoped to the wildcard domain, which is the only complete
+fix; it is what GitHub does with ``githubusercontent.com``. Registration takes
+weeks to months, so treat it as a launch blocker for hosting mutually
+untrusted tenants under one domain.
+
+**Prefer terminating TLS outside the cluster.** An Ingress can only reference a
+TLS Secret in its own namespace, and SkyPilot creates Ingresses in the task
+namespace. ``tls.mode: secret`` therefore requires the wildcard private key --
+which can impersonate every service in the fleet -- to be replicated into every
+namespace where user workloads run. This mode is gated behind
+``tls.i_understand_key_replication: true``. ``tls.mode: external`` keeps the
+key out of the cluster entirely.
+
+**Named hostnames are guessable.** Sub-path endpoints were obscure by accident
+(an IP plus an opaque pod name); a hostname is not. Configure ``auth.url`` so
+endpoints sit behind edge authentication, or acknowledge the exposure with
+``allow_unauthenticated: true``. Edge authentication is orthogonal to
+SkyServe's own API-key authorization; both can apply.
+
+.. warning::
+
+    Ingress NGINX was retired in March 2026 and receives no further security
+    patches. This feature is built on it because it is what SkyPilot's ingress
+    mode already uses, but a Gateway API backend is the intended destination;
+    ``tls.mode: external`` is compatible with terminating TLS at a Gateway
+    today.

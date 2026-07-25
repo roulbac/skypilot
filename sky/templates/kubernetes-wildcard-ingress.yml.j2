@@ -1,0 +1,47 @@
+{#
+  SkyServe wildcard-subdomain Ingress. Emitted only when
+  `kubernetes.ingress.wildcard_domain` is set, and owned solely by the
+  serve endpoint reconcile daemon.
+
+  It is a separate object from the sub-path Ingress because that one carries an
+  object-wide `rewrite-target: /$2` annotation, which would also rewrite these
+  root-path rules and strip the request path.
+#}
+ingress_spec:
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    labels:
+      parent: skypilot
+      {%- for label_key, label_value in labels.items() %}
+      {{ label_key }}: {{ label_value|tojson }}
+      {%- endfor %}
+    {#- Edge auth, plus SkyPilot's own bookkeeping: the service-to-hostname map
+        that readers resolve from, and the spec hash used to skip no-op
+        writes. Rendered as JSON so an empty set stays a mapping. #}
+    annotations: {{ annotations|tojson }}
+    name: {{ ingress_name }}
+    namespace: {{ namespace }}
+  spec:
+    ingressClassName: nginx
+    {%- if tls_secret_name %}
+    tls:
+    - hosts:
+      {%- for service in services_and_hosts %}
+      - {{ service.host }}
+      {%- endfor %}
+      secretName: {{ tls_secret_name }}
+    {%- endif %}
+    rules:
+    {%- for service in services_and_hosts %}
+    - host: {{ service.host }}
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: {{ service.service_name }}
+              port:
+                number: {{ service.service_port }}
+    {%- endfor %}

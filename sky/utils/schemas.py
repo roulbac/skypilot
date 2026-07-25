@@ -1523,6 +1523,67 @@ _PRICING_SCHEMA = {
     },
 }
 
+# Wildcard subdomain hostnames for SkyServe endpoints under
+# `kubernetes.ports: ingress`. Admin-only: see `SKIPPED_CLIENT_OVERRIDE_KEYS`,
+# which drops this block if a client sends it.
+_KUBERNETES_INGRESS_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    'additionalProperties': False,
+    'properties': {
+        # Unset (the default) keeps sub-path endpoints only.
+        'wildcard_domain': {
+            'anyOf': [{
+                'type': 'string',
+            }, {
+                'type': 'null',
+            }],
+        },
+        # Acknowledges that the wildcard domain shares a registrable domain
+        # with the API server, so a cookie scoped to the shared parent is
+        # readable by every deployed service.
+        'allow_shared_parent_domain': {
+            'type': 'boolean',
+        },
+        # Acknowledges that endpoints are exposed without edge authentication.
+        'allow_unauthenticated': {
+            'type': 'boolean',
+        },
+        'tls': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'mode': {
+                    'type': 'string',
+                    'enum': ['none', 'secret', 'external'],
+                },
+                'secret_name': {
+                    'type': 'string',
+                },
+                'i_understand_key_replication': {
+                    'type': 'boolean',
+                },
+            },
+        },
+        # Forward-auth endpoints, typically the oauth2-proxy that fronts the
+        # API server.
+        'auth': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'url': {
+                    'type': 'string',
+                },
+                'signin_url': {
+                    'type': 'string',
+                },
+            },
+        },
+    },
+}
+
 _CONTEXT_CONFIG_SCHEMA_MINIMAL = {
     'pod_config': {
         'type': 'object',
@@ -2013,6 +2074,11 @@ def get_config_schema():
                         },
                     },
                 },
+                # Deliberately not part of `_CONTEXT_CONFIG_SCHEMA_KUBERNETES`:
+                # it is admin-only and cannot be set per context, so that the
+                # single entry in `SKIPPED_CLIENT_OVERRIDE_KEYS` covers every
+                # path a client could set it from.
+                'ingress': _KUBERNETES_INGRESS_SCHEMA,
                 **_CONTEXT_CONFIG_SCHEMA_KUBERNETES,
                 **_extra_kubernetes_properties,
             }

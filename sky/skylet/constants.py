@@ -607,6 +607,10 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
     # Slurm cluster configs (workdir, tmpdir, etc.) are admin-managed
     # server-side settings and should not be overridden by clients.
     ('slurm', 'cluster_configs'),
+    # Wildcard subdomain routing decides the public hostname of every SkyServe
+    # service. A client that could set it could point a hostname operators
+    # trust at its own service. Admin-managed, server-side only.
+    ('kubernetes', 'ingress'),
 ]
 
 # Constants for Azure blob storage
