@@ -288,7 +288,8 @@ def _validate_wildcard_domain(wildcard_domain: str) -> str:
                 f'kubernetes.ingress.wildcard_domain {wildcard_domain!r} does '
                 'not share a registrable domain with the API server host '
                 f'{api_server_host!r}. SkyPilot authorizes service requests '
-                "using the caller's API server session, which a browser only "
+                'using the caller\'s API server session, which a browser '
+                'only '
                 'sends to hosts under the same registrable domain. Use, for '
                 'example, an API server on "skypilot.example.com" and '
                 'services on "*.skypilot.example.com".')

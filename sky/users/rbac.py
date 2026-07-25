@@ -161,6 +161,15 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     },
     # --- SkyServe reads ---
     {
+        # Forward-auth check for SkyServe wildcard-subdomain endpoints. Read
+        # only, and it enforces workspace access itself, so a viewer calling
+        # it learns nothing they are not already entitled to. Denying it here
+        # would lock viewer-role users out of services in workspaces they do
+        # have access to.
+        'path': '/serve/authz',
+        'method': 'GET'
+    },
+    {
         'path': '/serve/status',
         'method': 'POST'
     },
