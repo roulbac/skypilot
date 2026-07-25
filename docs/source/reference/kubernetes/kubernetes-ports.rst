@@ -183,166 +183,133 @@ SkyServe wildcard subdomains (experimental)
 .. note::
 
     Opt-in and off by default. When unset, SkyPilot's behavior is unchanged.
-    Read the security requirements below before enabling it on a multi-tenant
-    deployment.
 
-Sub-path endpoints break applications that expect to be served from the root
-path. With a wildcard domain configured, each SkyServe service is additionally
-served at the root of its own hostname:
+Sub-path endpoints break applications that expect the root path, and they carry
+no access control of their own. With a wildcard domain configured, each
+SkyServe service is served at the root of its own hostname **and SkyPilot
+authorizes every request to it**:
 
 .. code-block::
 
     $ sky serve status
     SERVICE   VERSION  ENDPOINT
-    my-llm    1        https://my-llm--a1b2c3d4.skyapps.io
+    my-llm    1        https://my-llm--a1b2c3d4.skypilot.example.com
 
-Hostnames are keyed on the **service name**, not the load balancer port the
-service happens to occupy. This matters because SkyServe services share one
-controller and are assigned ports with ``find_free_port(30001)``: a port-keyed
-hostname would be inherited by whichever service next took that port. Keying on
-the service name means the hostname belongs to the service for as long as the
-service exists, and disappears with it.
+Only callers who can reach the SkyPilot API server *and* have access to the
+workspace the service was deployed in can reach the service. Humans
+authenticate with their normal SSO login; machines use a
+:ref:`service account token <service-accounts>`. Services never handle
+authentication or authorization themselves.
 
 Cluster ports (``sky launch --ports``) continue to use sub-path endpoints.
 
-Prerequisites
-^^^^^^^^^^^^^
+Domain requirements
+^^^^^^^^^^^^^^^^^^^
 
-1. A domain you control, dedicated to serving user workloads. It must **not**
-   share a registrable domain with your API server (see below).
-2. A wildcard DNS record ``*.skyapps.io`` pointing at the ingress controller's
-   external IP or hostname.
-3. A wildcard TLS certificate, terminated either upstream of the cluster (a
-   cloud load balancer with an ACM/Google-managed certificate, or a Gateway) or
-   by the ingress controller. Wildcard issuance requires a DNS-01 challenge.
+The wildcard domain **must share a registrable domain with the API server**,
+for example an API server on ``skypilot.example.com`` and services on
+``*.skypilot.example.com``. Authorization uses the caller's API server session,
+and a browser only sends that session to hosts under the same registrable
+domain. SkyPilot refuses to start emitting hostnames otherwise.
+
+You also need:
+
+1. A wildcard DNS record ``*.skypilot.example.com`` pointing at the ingress
+   controller.
+2. A wildcard TLS certificate. Wildcard issuance requires a DNS-01 challenge.
    Prefer one wildcard certificate over per-service certificates: per-host
    certificates publish every service name to Certificate Transparency logs.
+3. The API server's SSO session cookie scoped to the shared parent domain, so
+   it reaches service hostnames -- ``--cookie-domain=.skypilot.example.com``
+   and ``--whitelist-domain=.skypilot.example.com`` on oauth2-proxy.
 
 Configuration
 ^^^^^^^^^^^^^
 
-These keys are **admin-only**. They are honored exclusively from the API
-server's own config (``apiService.config`` in the Helm chart); a value set in a
-client's ``~/.sky/config.yaml`` is dropped with a warning.
+Admin-only: honored exclusively from the API server's own config
+(``apiService.config`` in the Helm chart). A value set in a client's
+``~/.sky/config.yaml`` is dropped with a warning.
 
 .. code-block:: yaml
 
     kubernetes:
       ports: ingress
       ingress:
+        # Must share a registrable domain with the API server host.
         # Unset (the default) keeps sub-path endpoints only.
-        wildcard_domain: skyapps.io
+        wildcard_domain: skypilot.example.com
 
         tls:
-          # none     - no TLS at the ingress; endpoints are advertised as http://
-          # external - TLS terminated upstream (cloud LB, Gateway, mesh);
-          #            endpoints are advertised as https:// and no key enters
-          #            the cluster. Recommended.
+          # none     - no TLS at the ingress; endpoints advertised as http://
+          # external - TLS terminated upstream (cloud LB, Gateway, mesh).
+          #            No key enters the cluster. Recommended.
           # secret   - the ingress controller terminates TLS using a Secret.
           #            See the warning below.
           mode: external
 
-        # Put endpoints behind the same forward-auth service that fronts the
-        # API server. Required unless `allow_unauthenticated: true` is set.
-        auth:
-          url: https://auth.example.com/oauth2/auth
-          signin_url: https://auth.example.com/oauth2/start
+There is no auth configuration. SkyPilot derives the authorization endpoint
+from its own API server address, because a mistyped URL would silently expose
+every service.
 
-Hostnames have the form ``<service>--<8 hex>.<wildcard_domain>``. The separator
-is ``--`` rather than ``.`` so that a one-level ``*.<domain>`` certificate and
-DNS record are sufficient, and the hash is taken over the untruncated service
-identity so that truncating a long name cannot collide two services onto one
-hostname.
+How authorization works
+^^^^^^^^^^^^^^^^^^^^^^^
 
-How it stays in sync
-^^^^^^^^^^^^^^^^^^^^
+The ingress asks the API server about every request before it reaches a
+service:
 
-A reconciler on the API server re-derives the whole SkyServe Ingress from the
-live service table, so a removed service is simply absent from the next render
--- there is no incremental delete step that can be missed and leave a route
-behind. Writes are skipped when nothing has changed, so the reconcile does not
-reload the ingress controller on every pass. The resolved hostnames are
-published on the Ingress as a ``skypilot.co/serve-endpoint-hosts`` annotation
-and read back from there, so changing the naming scheme in a future release
-cannot invalidate a running service's endpoint.
+1. A request arrives for ``my-llm--a1b2c3d4.skypilot.example.com``.
+2. The ingress calls ``/serve/authz`` on the API server, forwarding the
+   original hostname and the caller's credentials.
+3. The API server authenticates the caller -- SSO session cookie for a human,
+   ``Authorization: Bearer`` service account token for a machine -- using the
+   same code path that protects every other API.
+4. It maps the hostname to a service, looks up that service's workspace, and
+   checks the caller's access to it.
+5. On success the request proceeds, carrying ``X-Skypilot-User``,
+   ``X-Skypilot-User-Id`` and ``X-Skypilot-Workspace`` so the service knows
+   who the caller is without authenticating anyone itself. On failure a human
+   is redirected to log in and a machine receives 401 or 403.
+
+Hostnames are keyed on the **service name**, not the load balancer port the
+service occupies, so a torn-down service's address is never inherited by
+whichever service next takes that port. The hostname-to-service map is
+maintained by a reconciler that re-derives it from the live service table, so
+a removed service loses both its route and its authorization entry.
 
 .. note::
 
     The reconcile runs periodically (default 60s, configurable via
-    ``daemons.serve-endpoint-reconcile-daemon.interval_seconds``). Between a
-    service being torn down and the next pass, its hostname can still resolve.
+    ``daemons.serve-endpoint-reconcile-daemon.interval_seconds``). A service
+    created just now is not reachable until the next pass, and a service whose
+    workspace was never recorded -- for instance one created before this
+    feature was enabled -- denies all requests until it is re-deployed.
 
-.. _kubernetes-wildcard-subdomains-security:
+Security notes
+^^^^^^^^^^^^^^
 
-Security requirements
-^^^^^^^^^^^^^^^^^^^^^
+**Services see the caller's session cookie.** The shared parent domain that
+makes authorization work also means the browser sends its SkyPilot session
+cookie to every service hostname, where the service's own code can read it
+from the request headers. A service can therefore act as its visitors against
+the API server. Deploy only services you trust as much as the API server
+itself; this is not a model for running mutually untrusted tenants under one
+domain.
 
-Under a wildcard domain, any user who can deploy a service can serve arbitrary
-JavaScript from a hostname under that domain. Sub-path endpoints never did
-this, so these requirements are new.
-
-**Use a separate registrable domain from the API server.** If the API server is
-at ``sky.example.com`` and services at ``*.serve.example.com``, a cookie scoped
-to ``Domain=.example.com`` -- which admins commonly configure to share
-oauth2-proxy sessions across tools -- is readable by every deployed service,
-which can then call the API server as that operator. Use, for example, the API
-server on ``sky.corp.example.com`` and services on ``*.skyapps.io``. SkyPilot
-refuses to emit hostnames when the two share a registrable domain, unless
-``allow_shared_parent_domain: true`` is set.
-
-If a second registrable domain is not available, the safe way to run services
-under a subdomain of the API server's domain is to register *that subdomain*
-in the Public Suffix List's private section -- the same mechanism behind
-``github.io``. Once ``serve.example.com`` is a PSL entry, browsers treat it as
-a domain boundary in its own right: nothing can set a cookie scoped to it, and
-it becomes a separate *site*, so the API server keeps its ``SameSite``
-protections against requests from services. Set
-``allow_shared_parent_domain: true`` once the entry has landed.
-
-Note that this is the opposite of what a cookie-authenticated app wants --
-`Coder <https://coder.com/docs/admin/networking/wildcard-access-url>`_, for
-instance, warns against PSL-listed wildcard domains because its workspace
-proxy needs cookies to reach the subdomain. SkyServe services are untrusted
-workloads behind an external auth proxy, so cookies reaching them are pure
-downside.
-
-.. warning::
-
-    Registering the subdomain does **not** stop cookies scoped to the parent
-    (``Domain=.example.com``) from reaching services, and it does not stop a
-    service from setting such a cookie and having it sent to every other
-    application under that parent. If other tools share ``example.com``, they
-    inherit that exposure. Adding label depth does not help either: cookie
-    scope follows the registrable domain, so ``*.a.b.c.example.com`` is no
-    more isolated than ``*.serve.example.com``.
-
-**Register the wildcard domain with the Public Suffix List.** Distinct origins
-separate services' DOM, storage and XHR, but cookies do not follow the
-same-origin policy: one service can set a cookie scoped to ``.skyapps.io`` and
-another can read *or forge* it. PSL registration makes browsers refuse
-``Domain=`` cookies scoped to the wildcard domain, which is the only complete
-fix; it is what GitHub does with ``githubusercontent.com``. Registration takes
-weeks to months, so treat it as a launch blocker for hosting mutually
-untrusted tenants under one domain.
+**Services can set cookies for the parent domain**, which are then sent to the
+API server and to other services. Keep the shared parent narrow -- prefer
+``*.skypilot.example.com`` over ``*.example.com`` -- so this does not extend
+to unrelated applications in your organization.
 
 **Prefer terminating TLS outside the cluster.** An Ingress can only reference a
 TLS Secret in its own namespace, and SkyPilot creates Ingresses in the task
 namespace. ``tls.mode: secret`` therefore requires the wildcard private key --
-which can impersonate every service in the fleet -- to be replicated into every
-namespace where user workloads run. This mode is gated behind
+which can impersonate every service -- to be replicated into every namespace
+where user workloads run. It is gated behind
 ``tls.i_understand_key_replication: true``. ``tls.mode: external`` keeps the
 key out of the cluster entirely.
-
-**Named hostnames are guessable.** Sub-path endpoints were obscure by accident
-(an IP plus an opaque pod name); a hostname is not. Configure ``auth.url`` so
-endpoints sit behind edge authentication, or acknowledge the exposure with
-``allow_unauthenticated: true``. Edge authentication is orthogonal to
-SkyServe's own API-key authorization; both can apply.
 
 .. warning::
 
     Ingress NGINX was retired in March 2026 and receives no further security
     patches. This feature is built on it because it is what SkyPilot's ingress
-    mode already uses, but a Gateway API backend is the intended destination;
-    ``tls.mode: external`` is compatible with terminating TLS at a Gateway
-    today.
+    mode already uses, but a Gateway API backend is the intended destination.

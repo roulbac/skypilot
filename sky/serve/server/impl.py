@@ -28,6 +28,7 @@ from sky.data import storage as storage_lib
 from sky.provision.kubernetes import network as kubernetes_network
 from sky.serve import constants as serve_constants
 from sky.serve import runner as serve_runner
+from sky.serve import serve_authz
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -478,6 +479,11 @@ def up(
                 '\n\n' + ux_utils.finishing_message(
                     'Service is spinning up and replicas '
                     'will be ready shortly.'))
+        # Record the workspace the service belongs to. The wildcard-subdomain
+        # authorization endpoint checks a caller's access against this, so it
+        # must be recorded before the endpoint can be served.
+        serve_authz.record_service_workspace(
+            service_name, skypilot_config.get_active_workspace())
         return service_name, endpoint
 
 
@@ -814,6 +820,12 @@ def down(
         raise RuntimeError(f'{e.details()} ({e.code()})') from e
     except grpc.FutureTimeoutError as e:
         raise RuntimeError('gRPC timed out') from e
+
+    # Drop the workspace records for the services that are gone. The endpoint
+    # reconciler also removes their hostnames on its next pass; this just
+    # keeps the record from lingering.
+    for name in service_names or []:
+        serve_authz.forget_service_workspace(name)
 
     logger.info(stdout)
 

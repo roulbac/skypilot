@@ -1,10 +1,13 @@
 """Rest APIs for SkyServe."""
 
+import asyncio
 import pathlib
+import urllib.parse
 
 import fastapi
 
 from sky import sky_logging
+from sky.serve import serve_authz
 from sky.serve.server import core
 from sky.server import stream_utils
 from sky.server.blob import blob_storage as bs
@@ -81,6 +84,71 @@ async def terminate_replica(
         request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         auth_user=request.state.auth_user,
     )
+
+
+@router.get('/authz')
+async def authz(request: fastapi.Request) -> fastapi.Response:
+    """Forward-auth endpoint for SkyServe wildcard-subdomain endpoints.
+
+    The edge proxy calls this before every request to a service hostname and
+    forwards the original request's ``Host``. Authentication has already
+    happened in middleware -- via the SSO session cookie for a human, or a
+    SkyPilot service account token for a machine -- so this only has to decide
+    whether that identity may reach *this* service.
+
+    Deliberately not an ``executor.schedule_request_async`` route: it is on the
+    hot path of every request to every service, so it answers inline.
+
+    Returns 200 to allow, 403 to deny. A 401 is produced by the middleware
+    when there is no valid identity, which the proxy turns into a login
+    redirect.
+    """
+    # pylint: disable=import-outside-toplevel
+    from sky.users import permission
+
+    auth_user = getattr(request.state, 'auth_user', None)
+    if auth_user is None or getattr(request.state, 'anonymous_user', False):
+        # Should be unreachable: middleware rejects unauthenticated requests
+        # before reaching a route. Fail closed regardless.
+        return fastapi.Response(status_code=401)
+
+    # The proxy forwards the hostname the browser asked for. ingress-nginx
+    # sends the full original URL; other proxies send a host header. Without
+    # one we cannot tell which service is being authorized, so deny.
+    host = (request.headers.get('X-Forwarded-Host') or
+            request.headers.get('X-Original-Host') or '')
+    if not host:
+        original_url = request.headers.get('X-Original-URL', '')
+        if original_url:
+            host = urllib.parse.urlparse(original_url).netloc
+    if not host:
+        logger.warning('SkyServe authz request without a forwarded host; '
+                       'denying.')
+        return fastapi.Response(status_code=403)
+
+    resolved = serve_authz.resolve_host(host)
+    if resolved is None:
+        # An unknown hostname under the wildcard domain: no service claims it.
+        logger.debug(f'SkyServe authz: no service for host {host!r}; denying.')
+        return fastapi.Response(status_code=403)
+    service_name, workspace = resolved
+
+    allowed = await asyncio.to_thread(
+        permission.permission_service.check_workspace_permission, auth_user.id,
+        workspace)
+    if not allowed:
+        logger.info(f'SkyServe authz: {auth_user.name} denied access to '
+                    f'service {service_name!r} in workspace {workspace!r}.')
+        return fastapi.Response(status_code=403)
+
+    # Pass the caller's identity to the service, so it never has to
+    # authenticate anyone itself.
+    return fastapi.Response(status_code=200,
+                            headers={
+                                'X-Skypilot-User': auth_user.name or '',
+                                'X-Skypilot-User-Id': auth_user.id,
+                                'X-Skypilot-Workspace': workspace,
+                            })
 
 
 @router.post('/status')

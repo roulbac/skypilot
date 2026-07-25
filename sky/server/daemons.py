@@ -361,6 +361,7 @@ def serve_endpoint_reconcile_event():
     """
     # pylint: disable=import-outside-toplevel
     from sky.provision.kubernetes import network as kubernetes_network
+    from sky.serve import serve_authz
     from sky.serve.server import impl as serve_impl
 
     interval = skypilot_config.get_nested(
@@ -380,7 +381,26 @@ def serve_endpoint_reconcile_event():
             cluster_name_on_cloud=cluster_name_on_cloud,
             service_to_port=service_to_port,
             provider_config=provider_config)
-        logger.debug(f'Reconciled {len(hosts)} SkyServe endpoint hostname(s).')
+
+        # Publish {hostname: (service, workspace)} so the authorization
+        # endpoint can resolve a request's Host without a Kubernetes call.
+        # A service whose workspace was never recorded (created before this
+        # feature, or by a different API server) is omitted rather than
+        # guessed at, so it fails closed instead of being authorized against
+        # the wrong workspace.
+        workspaces = serve_authz.get_service_workspaces()
+        published = {}
+        for service_name, host in hosts.items():
+            workspace = workspaces.get(service_name)
+            if workspace is None:
+                logger.warning(
+                    f'No workspace recorded for service {service_name!r}; its '
+                    'endpoint will deny all requests. Re-run `sky serve up` '
+                    'for the service to record it.')
+                continue
+            published[host] = (service_name, workspace)
+        serve_authz.publish_endpoint_hosts(published)
+        logger.debug(f'Reconciled {len(published)} SkyServe endpoint(s).')
     except Exception as e:  # pylint: disable=broad-except
         # Never let a reconcile failure take down the daemon; the next pass
         # re-derives the desired state from scratch.

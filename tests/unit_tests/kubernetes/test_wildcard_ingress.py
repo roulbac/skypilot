@@ -9,6 +9,8 @@ import pytest
 from sky import skypilot_config
 from sky.provision.kubernetes import network
 from sky.provision.kubernetes import network_utils
+from sky.serve import serve_authz
+from sky.serve.server import server as serve_server
 from sky.server import daemons
 from sky.skylet import constants
 
@@ -142,7 +144,11 @@ class TestRegistrableDomain:
         assert network_utils.get_registrable_domain(host) == expected
 
 
-def _config(**ingress):
+_API_SERVER = 'https://skypilot.example.com'
+_DOMAIN_UNDER_API = 'skypilot.example.com'
+
+
+def _config(_api_server_endpoint=_API_SERVER, **ingress):
     """Patches the loaded SkyPilot config with a `kubernetes.ingress` block."""
 
     def fake_get_nested(keys, default_value=None, **kwargs):
@@ -150,7 +156,7 @@ def _config(**ingress):
         if tuple(keys) == ('kubernetes', 'ingress'):
             return ingress
         if tuple(keys) == ('api_server', 'endpoint'):
-            return ingress.pop('_api_server_endpoint', None) or default_value
+            return _api_server_endpoint or default_value
         return default_value
 
     return mock.patch('sky.skypilot_config.get_nested',
@@ -165,16 +171,15 @@ class TestWildcardIngressConfig:
             assert network_utils.get_wildcard_ingress_config() is None
 
     def test_absent_wildcard_domain_is_disabled(self):
-        with _config(allow_unauthenticated=True):
+        with _config():
             assert network_utils.get_wildcard_ingress_config() is None
 
     def test_minimal_enabled_config(self):
-        with _config(wildcard_domain=_DOMAIN, allow_unauthenticated=True):
+        with _config(wildcard_domain=_DOMAIN_UNDER_API):
             config = network_utils.get_wildcard_ingress_config()
         assert config is not None
-        assert config.wildcard_domain == _DOMAIN
+        assert config.wildcard_domain == _DOMAIN_UNDER_API
         assert config.tls_mode == network_utils.WildcardIngressTLSMode.NONE
-        assert config.scheme == 'http'
 
     @pytest.mark.parametrize('domain', [
         'not a domain',
@@ -184,69 +189,72 @@ class TestWildcardIngressConfig:
         'sky@apps.io',
     ])
     def test_malformed_domain_rejected(self, domain):
-        with _config(wildcard_domain=domain, allow_unauthenticated=True):
+        with _config(wildcard_domain=domain):
             with pytest.raises(ValueError, match='Invalid'):
                 network_utils.get_wildcard_ingress_config()
 
     def test_empty_domain_is_disabled(self):
-        with _config(wildcard_domain='', allow_unauthenticated=True):
+        with _config(wildcard_domain=''):
             assert network_utils.get_wildcard_ingress_config() is None
 
-    @pytest.mark.parametrize('domain', ['SkyApps.IO', ' skyapps.io. '])
+    @pytest.mark.parametrize(
+        'domain', ['SkyPilot.Example.COM', ' skypilot.example.com. '])
     def test_domain_is_normalized(self, domain):
-        with _config(wildcard_domain=domain, allow_unauthenticated=True):
+        with _config(wildcard_domain=domain):
             config = network_utils.get_wildcard_ingress_config()
         assert config is not None
-        assert config.wildcard_domain == 'skyapps.io'
+        assert config.wildcard_domain == _DOMAIN_UNDER_API
 
-    def test_shared_registrable_parent_with_api_server_rejected(self):
-        """§4.1: a cookie on the shared parent is readable by every service."""
-        with _config(wildcard_domain='serve.example.com',
-                     allow_unauthenticated=True,
-                     _api_server_endpoint='https://sky.example.com'):
-            with pytest.raises(ValueError, match='shares a registrable domain'):
+    def test_domain_must_share_parent_with_api_server(self):
+        """The session cookie has to reach service hostnames.
+
+        SkyPilot authorizes requests using the caller's API server session. A
+        service on an unrelated registrable domain would never receive that
+        cookie, so every request would bounce to a login it cannot complete.
+        """
+        with _config(wildcard_domain='skyapps.io'):
+            with pytest.raises(ValueError,
+                               match='does not share a registrable domain'):
                 network_utils.get_wildcard_ingress_config()
 
-    def test_separate_registrable_domain_accepted(self):
-        with _config(wildcard_domain='skyapps.io',
-                     allow_unauthenticated=True,
-                     _api_server_endpoint='https://sky.example.com'):
+    def test_subdomain_of_api_server_accepted(self):
+        with _config(wildcard_domain='apps.skypilot.example.com'):
             assert network_utils.get_wildcard_ingress_config() is not None
 
-    def test_shared_parent_can_be_acknowledged(self):
+    def test_sibling_under_same_parent_accepted(self):
         with _config(wildcard_domain='serve.example.com',
-                     allow_unauthenticated=True,
-                     allow_shared_parent_domain=True,
                      _api_server_endpoint='https://sky.example.com'):
             assert network_utils.get_wildcard_ingress_config() is not None
 
-    def test_ip_api_server_host_skips_the_check(self):
-        with _config(wildcard_domain='skyapps.io',
-                     allow_unauthenticated=True,
-                     _api_server_endpoint='http://127.0.0.1:46580'):
-            assert network_utils.get_wildcard_ingress_config() is not None
-
-    def test_unauthenticated_exposure_requires_acknowledgement(self):
-        """§4.8: named hostnames are guessable, unlike sub-path endpoints."""
-        with _config(wildcard_domain=_DOMAIN):
-            with pytest.raises(ValueError, match='allow_unauthenticated'):
+    @pytest.mark.parametrize(
+        'endpoint', [None, '', 'http://127.0.0.1:46580', 'https://10.0.0.7'])
+    def test_api_server_must_be_a_hostname(self, endpoint):
+        """An IP or unset endpoint has no cookie scope to share."""
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
+                     _api_server_endpoint=endpoint):
+            with pytest.raises(ValueError, match='api_server.endpoint'):
                 network_utils.get_wildcard_ingress_config()
 
-    def test_auth_url_satisfies_the_requirement(self):
-        with _config(wildcard_domain=_DOMAIN,
-                     auth={
-                         'url': 'https://auth.example.com/oauth2/auth',
-                         'signin_url': 'https://auth.example.com/oauth2/start',
-                     }):
+    def test_auth_endpoints_are_derived_from_the_api_server(self):
+        """Never configured by an admin: a typo would expose every service."""
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
+                     tls={'mode': 'external'}):
             config = network_utils.get_wildcard_ingress_config()
         assert config is not None
-        assert config.auth_url == 'https://auth.example.com/oauth2/auth'
-        assert config.auth_signin_url == 'https://auth.example.com/oauth2/start'
+        assert config.auth_url == (
+            f'https://{_DOMAIN_UNDER_API}{network_utils.SERVE_AUTHZ_PATH}')
+        assert config.auth_signin_url.startswith(
+            f'https://{_DOMAIN_UNDER_API}/oauth2/start?rd=')
+
+    def test_auth_endpoint_scheme_follows_tls_mode(self):
+        with _config(wildcard_domain=_DOMAIN_UNDER_API):
+            config = network_utils.get_wildcard_ingress_config()
+        assert config is not None
+        assert config.auth_url.startswith('http://')
 
     def test_secret_tls_mode_requires_key_replication_ack(self):
-        """§4.3: the wildcard key would land in user-workload namespaces."""
-        with _config(wildcard_domain=_DOMAIN,
-                     allow_unauthenticated=True,
+        """The wildcard key would land in user-workload namespaces."""
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
                      tls={
                          'mode': 'secret',
                          'secret_name': 'skypilot-wildcard-tls',
@@ -256,8 +264,7 @@ class TestWildcardIngressConfig:
                 network_utils.get_wildcard_ingress_config()
 
     def test_secret_tls_mode_with_ack(self):
-        with _config(wildcard_domain=_DOMAIN,
-                     allow_unauthenticated=True,
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
                      tls={
                          'mode': 'secret',
                          'secret_name': 'skypilot-wildcard-tls',
@@ -269,8 +276,7 @@ class TestWildcardIngressConfig:
         assert config.scheme == 'https'
 
     def test_secret_tls_mode_requires_secret_name(self):
-        with _config(wildcard_domain=_DOMAIN,
-                     allow_unauthenticated=True,
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
                      tls={
                          'mode': 'secret',
                          'i_understand_key_replication': True,
@@ -279,9 +285,7 @@ class TestWildcardIngressConfig:
                 network_utils.get_wildcard_ingress_config()
 
     def test_external_tls_mode_emits_no_secret(self):
-        """TLS terminated upstream: https endpoints, no in-cluster key."""
-        with _config(wildcard_domain=_DOMAIN,
-                     allow_unauthenticated=True,
+        with _config(wildcard_domain=_DOMAIN_UNDER_API,
                      tls={'mode': 'external'}):
             config = network_utils.get_wildcard_ingress_config()
         assert config is not None
@@ -289,9 +293,7 @@ class TestWildcardIngressConfig:
         assert config.scheme == 'https'
 
     def test_invalid_tls_mode_rejected(self):
-        with _config(wildcard_domain=_DOMAIN,
-                     allow_unauthenticated=True,
-                     tls={'mode': 'acm'}):
+        with _config(wildcard_domain=_DOMAIN_UNDER_API, tls={'mode': 'acm'}):
             with pytest.raises(ValueError, match='tls.mode'):
                 network_utils.get_wildcard_ingress_config()
 
@@ -650,3 +652,157 @@ class TestServeEndpointReconcileDaemon:
                     'sky.server.daemons.time.sleep') as mock_sleep:
             daemons.serve_endpoint_reconcile_event()
         mock_sleep.assert_called_once()
+
+
+class TestServeAuthzState:
+    """`serve_authz` -- the state the authorization endpoint reads."""
+
+    def setup_method(self):
+        self._store = {}
+
+        def fake_get(key):
+            return self._store.get(key)
+
+        def fake_set(key, value):
+            self._store[key] = value
+
+        self._patches = [
+            mock.patch('sky.global_user_state.get_system_config',
+                       side_effect=fake_get),
+            mock.patch('sky.global_user_state.set_system_config',
+                       side_effect=fake_set),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def teardown_method(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_record_and_read_workspace(self):
+        serve_authz.record_service_workspace('my-llm', 'team-a')
+        assert serve_authz.get_service_workspaces() == {'my-llm': 'team-a'}
+
+    def test_forget_workspace(self):
+        serve_authz.record_service_workspace('my-llm', 'team-a')
+        serve_authz.forget_service_workspace('my-llm')
+        assert serve_authz.get_service_workspaces() == {}
+
+    def test_forget_unknown_service_is_a_noop(self):
+        serve_authz.forget_service_workspace('never-existed')
+        assert serve_authz.get_service_workspaces() == {}
+
+    def test_resolve_published_host(self):
+        serve_authz.publish_endpoint_hosts(
+            {'my-llm--abcd.skypilot.example.com': ('my-llm', 'team-a')})
+        assert serve_authz.resolve_host(
+            'my-llm--abcd.skypilot.example.com') == ('my-llm', 'team-a')
+
+    def test_resolve_strips_port_and_normalizes(self):
+        serve_authz.publish_endpoint_hosts(
+            {'my-llm--abcd.skypilot.example.com': ('my-llm', 'team-a')})
+        assert serve_authz.resolve_host(
+            'My-LLM--ABCD.skypilot.example.com:443') == ('my-llm', 'team-a')
+
+    def test_unknown_host_resolves_to_none(self):
+        """An unclaimed hostname must not authorize anything."""
+        serve_authz.publish_endpoint_hosts(
+            {'my-llm--abcd.skypilot.example.com': ('my-llm', 'team-a')})
+        assert serve_authz.resolve_host('evil.skypilot.example.com') is None
+        assert serve_authz.resolve_host('') is None
+
+    def test_publish_replaces_rather_than_merges(self):
+        """A torn-down service loses its hostname on the next publish."""
+        serve_authz.publish_endpoint_hosts({
+            'a.skypilot.example.com': ('a', 'w'),
+            'b.skypilot.example.com': ('b', 'w'),
+        })
+        serve_authz.publish_endpoint_hosts(
+            {'a.skypilot.example.com': ('a', 'w')})
+        assert serve_authz.resolve_host('b.skypilot.example.com') is None
+
+    def test_corrupt_state_is_treated_as_empty(self):
+        self._store['serve_endpoint_host_map'] = 'not json'
+        assert serve_authz.resolve_host('a.skypilot.example.com') is None
+
+
+class TestServeAuthzEndpoint:
+    """`/serve/authz` -- SkyPilot, not the service, decides who gets in."""
+
+    @staticmethod
+    def _auth_user(user_id='u1', email='a@b.com'):
+        # `Mock(name=...)` names the mock rather than setting `.name`.
+        user = mock.Mock(id=user_id)
+        user.name = email
+        return user
+
+    @classmethod
+    def _request(cls, headers, auth_user='default'):
+        if auth_user == 'default':
+            auth_user = cls._auth_user()
+        request = mock.Mock()
+        request.headers = headers
+        request.state.auth_user = auth_user
+        request.state.anonymous_user = False
+        return request
+
+    @staticmethod
+    async def _call(request, resolved, allowed=True):
+        with mock.patch('sky.serve.serve_authz.resolve_host',
+                        return_value=resolved), mock.patch(
+                            'sky.users.permission.permission_service'
+                            '.check_workspace_permission',
+                            return_value=allowed) as mock_check:
+            response = await serve_server.authz(request)
+        return response, mock_check
+
+    @pytest.mark.asyncio
+    async def test_allows_workspace_member(self):
+        request = self._request(
+            {'X-Forwarded-Host': 'my-llm--abcd.skypilot.example.com'})
+        response, mock_check = await self._call(request, ('my-llm', 'team-a'))
+        assert response.status_code == 200
+        mock_check.assert_called_once_with('u1', 'team-a')
+        # Identity is handed to the service so it never authenticates anyone.
+        assert response.headers['X-Skypilot-User'] == 'a@b.com'
+        assert response.headers['X-Skypilot-Workspace'] == 'team-a'
+
+    @pytest.mark.asyncio
+    async def test_denies_non_member(self):
+        request = self._request(
+            {'X-Forwarded-Host': 'my-llm--abcd.skypilot.example.com'})
+        response, _ = await self._call(request, ('my-llm', 'team-a'),
+                                       allowed=False)
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_denies_unknown_hostname(self):
+        """A hostname no service claims must not be authorized."""
+        request = self._request({'X-Forwarded-Host': 'evil.example.com'})
+        response, mock_check = await self._call(request, None)
+        assert response.status_code == 403
+        mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_denies_when_no_host_is_forwarded(self):
+        """Without a host we cannot tell which service to authorize."""
+        request = self._request({})
+        response, mock_check = await self._call(request, ('a', 'w'))
+        assert response.status_code == 403
+        mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reads_host_from_original_url(self):
+        """ingress-nginx forwards the full original URL, not a host header."""
+        request = self._request(
+            {'X-Original-URL': 'https://my-llm--abcd.skypilot.example.com/v1'})
+        response, _ = await self._call(request, ('my-llm', 'team-a'))
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_without_an_identity(self):
+        request = self._request({'X-Forwarded-Host': 'a.skypilot.example.com'},
+                                auth_user=None)
+        response, mock_check = await self._call(request, ('a', 'w'))
+        assert response.status_code == 401
+        mock_check.assert_not_called()

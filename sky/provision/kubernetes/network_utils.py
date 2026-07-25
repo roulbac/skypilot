@@ -53,6 +53,15 @@ SERVE_ENDPOINT_HOSTS_ANNOTATION = 'skypilot.co/serve-endpoint-hosts'
 # would produce reload storms proportional to the number of API servers.
 SPEC_HASH_ANNOTATION = 'skypilot.co/spec-hash'
 
+# Forward-auth endpoint on the API server. Every request to every service
+# hostname is authorized here before it reaches the service.
+SERVE_AUTHZ_PATH = '/serve/authz'
+
+# Identity the authz endpoint returns, forwarded to the service so it never
+# has to authenticate anyone itself.
+SERVE_AUTH_RESPONSE_HEADERS = ('X-Skypilot-User,X-Skypilot-User-Id,'
+                               'X-Skypilot-Workspace')
+
 # A DNS label is capped at 63 bytes. The generated label is
 # `<name>--<8 hex chars>`, so the name portion is capped well below that to
 # leave headroom.
@@ -239,40 +248,51 @@ def _get_api_server_host() -> Optional[str]:
     return host
 
 
-def _validate_wildcard_domain(wildcard_domain: str,
-                              allow_shared_parent_domain: bool) -> None:
-    """Validates the wildcard domain itself and its relation to the API server.
+def _validate_wildcard_domain(wildcard_domain: str) -> str:
+    """Validates the wildcard domain and returns the API server host.
+
+    SkyPilot authorizes every request to a service itself, using the caller's
+    API server session or service account token. For a browser session to be
+    present on a service hostname at all, services must sit under the same
+    registrable domain as the API server -- otherwise the session cookie can
+    never reach them and every request would bounce to a login that cannot
+    complete.
+
+    So this design *requires* the shared parent, e.g. API server on
+    ``skypilot.example.com`` and services on ``*.skypilot.example.com``.
 
     Raises:
-        ValueError: if the domain is malformed, or shares a registrable parent
-            with the API server host without an explicit acknowledgement.
+        ValueError: if the domain is malformed, the API server host is unknown,
+            or the two do not share a registrable domain.
     """
     if not _VALID_DOMAIN_RE.fullmatch(wildcard_domain):
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 f'Invalid kubernetes.ingress.wildcard_domain '
                 f'{wildcard_domain!r}: expected a domain with at least two '
-                'labels, e.g. "skyapps.io".')
+                'labels, e.g. "skypilot.example.com".')
 
     api_server_host = _get_api_server_host()
     if api_server_host is None:
-        return
-    if allow_shared_parent_domain:
-        return
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'kubernetes.ingress.wildcard_domain requires the API server '
+                'to be reachable at a hostname, so services can share its '
+                'login session. Set api_server.endpoint to the external '
+                'hostname of the API server; an IP address is not enough.')
+
     if (get_registrable_domain(wildcard_domain) !=
             get_registrable_domain(api_server_host)):
-        return
-    with ux_utils.print_exception_no_traceback():
-        raise ValueError(
-            f'kubernetes.ingress.wildcard_domain {wildcard_domain!r} shares a '
-            f'registrable domain with the API server host {api_server_host!r}.'
-            ' Services deployed under the wildcard domain can serve arbitrary '
-            'JavaScript, and a cookie scoped to the shared parent domain '
-            '(e.g. from oauth2-proxy) would be readable by every one of them. '
-            'Use a separate registrable domain for services, e.g. API server '
-            'on "sky.corp.example.com" and services on "*.skyapps.io". If the '
-            'API server is not cookie-authenticated and you accept the risk, '
-            'set kubernetes.ingress.allow_shared_parent_domain: true.')
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'kubernetes.ingress.wildcard_domain {wildcard_domain!r} does '
+                'not share a registrable domain with the API server host '
+                f'{api_server_host!r}. SkyPilot authorizes service requests '
+                "using the caller's API server session, which a browser only "
+                'sends to hosts under the same registrable domain. Use, for '
+                'example, an API server on "skypilot.example.com" and '
+                'services on "*.skypilot.example.com".')
+    return api_server_host
 
 
 def is_ingress_config_present() -> bool:
@@ -310,10 +330,7 @@ def get_wildcard_ingress_config() -> Optional[WildcardIngressConfig]:
     # `spec.tls` hosts and the recorded annotation all agree.
     wildcard_domain = wildcard_domain.strip().strip('.').lower()
 
-    _validate_wildcard_domain(wildcard_domain,
-                              allow_shared_parent_domain=bool(
-                                  ingress_config.get(
-                                      'allow_shared_parent_domain', False)))
+    api_server_host = _validate_wildcard_domain(wildcard_domain)
 
     tls_config = ingress_config.get('tls') or {}
     tls_mode = tls_config.get('mode', WildcardIngressTLSMode.NONE)
@@ -345,35 +362,17 @@ def get_wildcard_ingress_config() -> Optional[WildcardIngressConfig]:
     else:
         tls_secret_name = None
 
-    auth_config = ingress_config.get('auth') or {}
-    auth_url = auth_config.get('url')
-    if not auth_url and not ingress_config.get('allow_unauthenticated', False):
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError(
-                'Wildcard hostnames are guessable, unlike the opaque sub-path '
-                'endpoints they replace, so anything previously protected by '
-                'obscurity becomes reachable. Set '
-                'kubernetes.ingress.auth.url (and typically auth.signin_url) '
-                'to put the endpoints behind the same forward-auth service '
-                'that fronts the API server, or set '
-                'kubernetes.ingress.allow_unauthenticated: true to expose '
-                'them without edge authentication.')
-
-    # Distinct origins separate services' DOM, storage and XHR, but cookies do
-    # not follow the same-origin policy: one service can set a cookie scoped to
-    # the wildcard domain and read or forge it in another. Registering the
-    # domain with the Public Suffix List is the only complete fix.
-    logger.debug(
-        f'Services under *.{wildcard_domain} share a cookie-settable parent '
-        'domain. Register it with the Public Suffix List before hosting '
-        'mutually untrusted tenants.')
-
+    # Auth endpoints are derived, not configured: SkyPilot knows where its own
+    # API server is, and a mistyped auth URL would silently expose every
+    # service.
+    scheme = 'https' if tls_mode != WildcardIngressTLSMode.NONE else 'http'
     return WildcardIngressConfig(
         wildcard_domain=wildcard_domain,
         tls_mode=tls_mode,
         tls_secret_name=tls_secret_name,
-        auth_url=auth_url,
-        auth_signin_url=auth_config.get('signin_url'),
+        auth_url=f'{scheme}://{api_server_host}{SERVE_AUTHZ_PATH}',
+        auth_signin_url=(f'{scheme}://{api_server_host}/oauth2/start'
+                         '?rd=$escaped_request_uri'),
     )
 
 
@@ -541,6 +540,9 @@ def fill_wildcard_ingress_template(
     if wildcard_config.auth_signin_url is not None:
         annotations['nginx.ingress.kubernetes.io/auth-signin'] = (
             wildcard_config.auth_signin_url)
+    if wildcard_config.auth_url is not None:
+        annotations['nginx.ingress.kubernetes.io/auth-response-headers'] = (
+            SERVE_AUTH_RESPONSE_HEADERS)
     annotations.update(extra_annotations or {})
 
     j2_template = jinja2.Template(template)

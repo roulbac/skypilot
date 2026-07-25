@@ -1531,23 +1531,15 @@ _KUBERNETES_INGRESS_SCHEMA = {
     'required': [],
     'additionalProperties': False,
     'properties': {
-        # Unset (the default) keeps sub-path endpoints only.
+        # Must share a registrable domain with the API server host, so that a
+        # caller's API server session reaches service hostnames. Unset (the
+        # default) keeps sub-path endpoints only.
         'wildcard_domain': {
             'anyOf': [{
                 'type': 'string',
             }, {
                 'type': 'null',
             }],
-        },
-        # Acknowledges that the wildcard domain shares a registrable domain
-        # with the API server, so a cookie scoped to the shared parent is
-        # readable by every deployed service.
-        'allow_shared_parent_domain': {
-            'type': 'boolean',
-        },
-        # Acknowledges that endpoints are exposed without edge authentication.
-        'allow_unauthenticated': {
-            'type': 'boolean',
         },
         'tls': {
             'type': 'object',
@@ -1563,21 +1555,6 @@ _KUBERNETES_INGRESS_SCHEMA = {
                 },
                 'i_understand_key_replication': {
                     'type': 'boolean',
-                },
-            },
-        },
-        # Forward-auth endpoints, typically the oauth2-proxy that fronts the
-        # API server.
-        'auth': {
-            'type': 'object',
-            'required': [],
-            'additionalProperties': False,
-            'properties': {
-                'url': {
-                    'type': 'string',
-                },
-                'signin_url': {
-                    'type': 'string',
                 },
             },
         },
