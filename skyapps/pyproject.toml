@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skyapps"
+version = "0.1.0"
+description = "SkyPilot API server plugin: hostname-based SkyServe routing"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["skyapps*"]

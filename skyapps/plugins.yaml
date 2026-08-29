@@ -1,0 +1,8 @@
+plugins:
+- class: skyapps.SkyAppsPlugin
+  parameters:
+    base_domain: apps.example.com
+    scheme: https
+    # In-cluster Traefik should point at the serve controller Service DNS.
+    # backend_host: sky-serve-controller.ns.svc.cluster.local
+    # backend_scheme: http
