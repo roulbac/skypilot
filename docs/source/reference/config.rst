@@ -1648,6 +1648,26 @@ Can be one of:
 
 Default: ``loadbalancer``.
 
+.. _config-yaml-kubernetes-ingress:
+
+``kubernetes.ingress``
+~~~~~~~~~~~~~~~~~~~~~~
+
+Settings for SkyPilot-generated Ingress objects (optional).
+
+- ``class_name``: ``ingressClassName`` on generated Ingresses. Default: ``nginx``.
+- ``controller_service``: Service name used to resolve the controller's external IP. Default: ``ingress-nginx-controller``.
+- ``controller_namespace``: Namespace of that Service. Default: ``ingress-nginx``.
+
+.. code-block:: yaml
+
+  kubernetes:
+    ports: ingress
+    ingress:
+      class_name: nginx
+      controller_service: ingress-nginx-controller
+      controller_namespace: ingress-nginx
+
 .. _config-yaml-kubernetes-remote-identity:
 
 ``kubernetes.remote_identity``

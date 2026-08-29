@@ -83,7 +83,9 @@ def _open_ports_using_ingress(
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
     overrides = provider_config.get('cluster_config_overrides')
     # Check if an ingress controller exists
-    if not network_utils.ingress_controller_exists(context):
+    ingress_class_name = network_utils.get_ingress_settings(
+        context, overrides)['class_name']
+    if not network_utils.ingress_controller_exists(context, ingress_class_name):
         raise Exception(
             'Ingress controller not found. '
             'Install Nginx ingress controller first: '

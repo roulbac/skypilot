@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from sky.provision.kubernetes import network
+from sky.provision.kubernetes import network_utils
 
 
 class TestOpenPortsUsingIngress:
@@ -120,3 +121,56 @@ class TestOpenPortsUsingIngress:
             assert 'team-b' in url_path, (
                 f'Every port URL path must use the resolved namespace, '
                 f'got: {url_path!r}')
+
+
+def _fake_ingress_config(class_name='nginx'):
+
+    def fake_get(cloud,
+                 keys,
+                 region=None,
+                 default_value=None,
+                 override_configs=None,
+                 merge_dicts=False):
+        if keys == ('ingress', 'class_name'):
+            return class_name
+        return default_value
+
+    return fake_get
+
+
+class TestFillIngressTemplate:
+    """Generated Ingresses honor kubernetes.ingress.class_name."""
+
+    @patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
+           '.get_cleaned_context_and_cloud_str',
+           return_value=('ctx', 'kubernetes'))
+    @patch('sky.provision.kubernetes.network_utils.skypilot_config'
+           '.get_effective_region_config')
+    def test_default_class_is_nginx(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_ingress_config('nginx')
+        content = network_utils.fill_ingress_template(
+            namespace='ns',
+            context='ctx',
+            service_details=[('svc', 8080, 'skypilot/ns/c/8080')],
+            ingress_name='ing',
+            selector_key='k',
+            selector_value='v',
+        )
+        assert content['ingress_spec']['spec']['ingressClassName'] == 'nginx'
+
+    @patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
+           '.get_cleaned_context_and_cloud_str',
+           return_value=('ctx', 'kubernetes'))
+    @patch('sky.provision.kubernetes.network_utils.skypilot_config'
+           '.get_effective_region_config')
+    def test_override_class_name(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_ingress_config('traefik')
+        content = network_utils.fill_ingress_template(
+            namespace='ns',
+            context='ctx',
+            service_details=[('svc', 8080, 'skypilot/ns/c/8080')],
+            ingress_name='ing',
+            selector_key='k',
+            selector_value='v',
+        )
+        assert content['ingress_spec']['spec']['ingressClassName'] == 'traefik'

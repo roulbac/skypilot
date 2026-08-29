@@ -25,6 +25,44 @@ logger = sky_logging.init_logger(__name__)
 _INGRESS_TEMPLATE_NAME = 'kubernetes-ingress.yml.j2'
 _LOADBALANCER_TEMPLATE_NAME = 'kubernetes-loadbalancer.yml.j2'
 
+_DEFAULT_INGRESS_CLASS_NAME = 'nginx'
+_DEFAULT_INGRESS_CONTROLLER_SERVICE = 'ingress-nginx-controller'
+_DEFAULT_INGRESS_CONTROLLER_NAMESPACE = 'ingress-nginx'
+
+
+def _ingress_setting(
+        context: Optional[str],
+        key: str,
+        default: str,
+        cluster_config_overrides: Optional[Dict[str, Any]] = None) -> str:
+    context, cloud_str = kubernetes_utils.get_cleaned_context_and_cloud_str(
+        context)
+    value = skypilot_config.get_effective_region_config(
+        cloud=cloud_str,
+        region=context,
+        keys=('ingress', key),
+        default_value=default,
+        override_configs=cluster_config_overrides)
+    return default if value is None else str(value)
+
+
+def get_ingress_settings(
+    context: Optional[str],
+    cluster_config_overrides: Optional[Dict[str,
+                                            Any]] = None) -> Dict[str, str]:
+    """Ingress class and controller Service lookup, with nginx defaults."""
+    return {
+        'class_name': _ingress_setting(context, 'class_name',
+                                       _DEFAULT_INGRESS_CLASS_NAME,
+                                       cluster_config_overrides),
+        'controller_service': _ingress_setting(
+            context, 'controller_service', _DEFAULT_INGRESS_CONTROLLER_SERVICE,
+            cluster_config_overrides),
+        'controller_namespace': _ingress_setting(
+            context, 'controller_namespace',
+            _DEFAULT_INGRESS_CONTROLLER_NAMESPACE, cluster_config_overrides),
+    }
+
 
 def get_port_mode(
         mode_str: Optional[str],
@@ -141,6 +179,8 @@ def fill_ingress_template(
         selector_value=selector_value,
         annotations=annotations,
         labels=labels,
+        ingress_class_name=get_ingress_settings(
+            context, cluster_config_overrides)['class_name'],
     )
     content = yaml_utils.safe_load(cont)
 
@@ -242,14 +282,18 @@ def ingress_controller_exists(context: Optional[str],
 
 def get_ingress_external_ip_and_ports(
     context: Optional[str],
-    namespace: str = 'ingress-nginx'
+    namespace: Optional[str] = None,
+    service_name: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Returns external ip and ports for the ingress controller."""
+    settings = get_ingress_settings(context)
+    namespace = namespace or settings['controller_namespace']
+    service_name = service_name or settings['controller_service']
     core_api = kubernetes.core_api(context)
     ingress_services = [
         item for item in core_api.list_namespaced_service(
             namespace, _request_timeout=kubernetes.API_TIMEOUT).items
-        if item.metadata.name == 'ingress-nginx-controller'
+        if item.metadata.name == service_name
     ]
     if not ingress_services:
         return (None, None)
