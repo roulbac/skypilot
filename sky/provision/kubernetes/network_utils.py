@@ -229,6 +229,13 @@ def delete_namespaced_service(context: Optional[str], namespace: str,
         raise e
 
 
+# Default nginx ingress controller Service. Querying endpoints and opening
+# ports both depend on this object existing; an IngressClass alone is not
+# enough (Gateway API clusters often have neither this Service nor nginx).
+INGRESS_CONTROLLER_SERVICE_NAME = 'ingress-nginx-controller'
+INGRESS_CONTROLLER_NAMESPACE = 'ingress-nginx'
+
+
 def ingress_controller_exists(context: Optional[str],
                               ingress_class_name: str = 'nginx') -> bool:
     """Checks if an ingress controller exists in the cluster."""
@@ -240,21 +247,47 @@ def ingress_controller_exists(context: Optional[str],
             ingress_classes))
 
 
+def get_ingress_controller_service(
+    context: Optional[str],
+    namespace: str = INGRESS_CONTROLLER_NAMESPACE,
+    service_name: str = INGRESS_CONTROLLER_SERVICE_NAME,
+) -> Optional[Any]:
+    """Return the ingress controller Service, or None if it is missing."""
+    core_api = kubernetes.core_api(context)
+    try:
+        services = core_api.list_namespaced_service(
+            namespace, _request_timeout=kubernetes.API_TIMEOUT).items
+    except kubernetes.kubernetes.client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    for item in services:
+        if item.metadata.name == service_name:
+            return item
+    return None
+
+
+def ingress_controller_service_exists(
+        context: Optional[str],
+        namespace: str = INGRESS_CONTROLLER_NAMESPACE,
+        service_name: str = INGRESS_CONTROLLER_SERVICE_NAME) -> bool:
+    """Checks if the ingress controller Service exists in the cluster."""
+    return get_ingress_controller_service(context,
+                                          namespace=namespace,
+                                          service_name=service_name) is not None
+
+
 def get_ingress_external_ip_and_ports(
     context: Optional[str],
-    namespace: str = 'ingress-nginx'
+    namespace: str = INGRESS_CONTROLLER_NAMESPACE,
+    service_name: str = INGRESS_CONTROLLER_SERVICE_NAME,
 ) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Returns external ip and ports for the ingress controller."""
-    core_api = kubernetes.core_api(context)
-    ingress_services = [
-        item for item in core_api.list_namespaced_service(
-            namespace, _request_timeout=kubernetes.API_TIMEOUT).items
-        if item.metadata.name == 'ingress-nginx-controller'
-    ]
-    if not ingress_services:
+    ingress_service = get_ingress_controller_service(context,
+                                                     namespace=namespace,
+                                                     service_name=service_name)
+    if ingress_service is None:
         return (None, None)
-
-    ingress_service = ingress_services[0]
     if ingress_service.status.load_balancer.ingress is None:
         # We try to get an IP/host for the service in the following order:
         # 1. Try to use assigned external IP if it exists
