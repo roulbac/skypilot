@@ -1643,7 +1643,7 @@ Port configuration mode (optional).
 Can be one of:
 
 - ``loadbalancer``: Use LoadBalancer service to expose ports.
-- ``nodeport``: Use NodePort service to expose ports.
+- ``ingress``: Use an Ingress to expose ports. See :ref:`kubernetes.ingress <config-yaml-kubernetes-ingress>`.
 - ``podip``: Use Pod IPs to expose ports. Cannot be accessed from outside the cluster.
 
 Default: ``loadbalancer``.
@@ -1653,20 +1653,22 @@ Default: ``loadbalancer``.
 ``kubernetes.ingress``
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Settings for SkyPilot-generated Ingress objects (optional).
+Settings for the Ingress objects SkyPilot generates when :ref:`kubernetes.ports <config-yaml-kubernetes-ports>` is ``ingress`` (optional).
 
-- ``class_name``: ``ingressClassName`` on generated Ingresses. Default: ``nginx``.
-- ``controller_service``: Service name used to resolve the controller's external IP. Default: ``ingress-nginx-controller``.
-- ``controller_namespace``: Namespace of that Service. Default: ``ingress-nginx``.
+The defaults match a stock `ingress-nginx <https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md>`_ install; set these if you run a different controller, or nginx under a different class or namespace.
+
+- ``class_name``: ``ingressClassName`` written on the generated Ingresses. Default: ``nginx``.
+- ``controller_service``: name of the ingress controller's Service, which SkyPilot reads to resolve endpoints. Default: ``ingress-nginx-controller``.
+- ``controller_namespace``: namespace of that Service. Default: ``ingress-nginx``.
 
 .. code-block:: yaml
 
   kubernetes:
     ports: ingress
     ingress:
-      class_name: nginx
-      controller_service: ingress-nginx-controller
-      controller_namespace: ingress-nginx
+      class_name: traefik
+      controller_service: traefik
+      controller_namespace: traefik
 
 .. _config-yaml-kubernetes-remote-identity:
 

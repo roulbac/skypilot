@@ -87,10 +87,11 @@ def _open_ports_using_ingress(
         context, overrides)['class_name']
     if not network_utils.ingress_controller_exists(context, ingress_class_name):
         raise Exception(
-            'Ingress controller not found. '
-            'Install Nginx ingress controller first: '
-            'https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md.'  # pylint: disable=line-too-long
-        )
+            f'No IngressClass named {ingress_class_name!r} in the cluster. '
+            'Install the Nginx ingress controller '
+            '(https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md), '  # pylint: disable=line-too-long
+            'or set kubernetes.ingress.class_name to the IngressClass of the '
+            'controller you run.')
 
     # URL path namespace must match the Service's namespace (resolved above
     # from `provider_config`); per-workspace overrides can make these differ.

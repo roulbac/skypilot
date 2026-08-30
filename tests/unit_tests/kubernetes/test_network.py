@@ -1,6 +1,9 @@
 """Tests for `sky/provision/kubernetes/network.py`."""
 
+import types
 from unittest.mock import patch
+
+import pytest
 
 from sky.provision.kubernetes import network
 from sky.provision.kubernetes import network_utils
@@ -122,8 +125,35 @@ class TestOpenPortsUsingIngress:
                 f'Every port URL path must use the resolved namespace, '
                 f'got: {url_path!r}')
 
+    @patch('sky.provision.kubernetes.network.network_utils'
+           '.ingress_controller_exists')
+    @patch('sky.provision.kubernetes.network.network_utils'
+           '.get_ingress_settings')
+    @patch('sky.provision.kubernetes.network.kubernetes_utils'
+           '.get_context_from_config')
+    def test_checks_the_configured_ingress_class(self, mock_get_context,
+                                                 mock_settings,
+                                                 mock_ingress_exists):
+        """The IngressClass we look for is the one we will write, not nginx."""
+        mock_get_context.return_value = 'ctx'
+        mock_settings.return_value = {'class_name': 'traefik'}
+        mock_ingress_exists.return_value = False
 
-def _fake_ingress_config(class_name='nginx'):
+        with pytest.raises(Exception, match='traefik'):
+            network._open_ports_using_ingress(  # pylint: disable=protected-access
+                cluster_name_on_cloud='cluster0',
+                ports=[8080],
+                provider_config={
+                    'context': 'ctx',
+                    'namespace': 'default'
+                },
+            )
+
+        mock_ingress_exists.assert_called_once_with('ctx', 'traefik')
+
+
+def _fake_region_config(ingress=None):
+    """Stub for skypilot_config.get_effective_region_config."""
 
     def fake_get(cloud,
                  keys,
@@ -131,24 +161,59 @@ def _fake_ingress_config(class_name='nginx'):
                  default_value=None,
                  override_configs=None,
                  merge_dicts=False):
-        if keys == ('ingress', 'class_name'):
-            return class_name
+        del cloud, region, override_configs, merge_dicts  # Unused.
+        if keys == ('ingress',):
+            return default_value if ingress is None else ingress
         return default_value
 
     return fake_get
 
 
-class TestFillIngressTemplate:
-    """Generated Ingresses honor kubernetes.ingress.class_name."""
+def _service(name, ip='1.2.3.4'):
+    return types.SimpleNamespace(
+        metadata=types.SimpleNamespace(name=name, annotations=None),
+        spec=types.SimpleNamespace(external_i_ps=None, ports=[]),
+        status=types.SimpleNamespace(load_balancer=types.SimpleNamespace(
+            ingress=[types.SimpleNamespace(ip=ip, hostname=None)])),
+    )
 
-    @patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
-           '.get_cleaned_context_and_cloud_str',
-           return_value=('ctx', 'kubernetes'))
-    @patch('sky.provision.kubernetes.network_utils.skypilot_config'
-           '.get_effective_region_config')
-    def test_default_class_is_nginx(self, mock_get, mock_ctx):
-        mock_get.side_effect = _fake_ingress_config('nginx')
-        content = network_utils.fill_ingress_template(
+
+@patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
+       '.get_cleaned_context_and_cloud_str',
+       return_value=('ctx', 'kubernetes'))
+@patch('sky.provision.kubernetes.network_utils.skypilot_config'
+       '.get_effective_region_config')
+class TestIngressSettings:
+    """`kubernetes.ingress` falls back to the ingress-nginx defaults."""
+
+    def test_defaults_when_unset(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_region_config()
+        assert network_utils.get_ingress_settings('ctx') == {
+            'class_name': 'nginx',
+            'controller_service': 'ingress-nginx-controller',
+            'controller_namespace': 'ingress-nginx',
+        }
+
+    def test_partial_config_keeps_other_defaults(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_region_config({'class_name': 'traefik'})
+        assert network_utils.get_ingress_settings('ctx') == {
+            'class_name': 'traefik',
+            'controller_service': 'ingress-nginx-controller',
+            'controller_namespace': 'ingress-nginx',
+        }
+
+
+@patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
+       '.get_cleaned_context_and_cloud_str',
+       return_value=('ctx', 'kubernetes'))
+@patch('sky.provision.kubernetes.network_utils.skypilot_config'
+       '.get_effective_region_config')
+class TestFillIngressTemplate:
+    """Generated Ingresses carry the configured ingressClassName."""
+
+    @staticmethod
+    def _render():
+        return network_utils.fill_ingress_template(
             namespace='ns',
             context='ctx',
             service_details=[('svc', 8080, 'skypilot/ns/c/8080')],
@@ -156,21 +221,50 @@ class TestFillIngressTemplate:
             selector_key='k',
             selector_value='v',
         )
+
+    def test_default_class_is_nginx(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_region_config()
+        content = self._render()
         assert content['ingress_spec']['spec']['ingressClassName'] == 'nginx'
 
-    @patch('sky.provision.kubernetes.network_utils.kubernetes_utils'
-           '.get_cleaned_context_and_cloud_str',
-           return_value=('ctx', 'kubernetes'))
-    @patch('sky.provision.kubernetes.network_utils.skypilot_config'
-           '.get_effective_region_config')
-    def test_override_class_name(self, mock_get, mock_ctx):
-        mock_get.side_effect = _fake_ingress_config('traefik')
-        content = network_utils.fill_ingress_template(
-            namespace='ns',
-            context='ctx',
-            service_details=[('svc', 8080, 'skypilot/ns/c/8080')],
-            ingress_name='ing',
-            selector_key='k',
-            selector_value='v',
-        )
+    def test_configured_class_name_is_rendered(self, mock_get, mock_ctx):
+        mock_get.side_effect = _fake_region_config({'class_name': 'traefik'})
+        content = self._render()
         assert content['ingress_spec']['spec']['ingressClassName'] == 'traefik'
+
+
+class TestGetIngressExternalIpAndPorts:
+    """Endpoints resolve from the configured controller Service."""
+
+    @patch('sky.provision.kubernetes.network_utils.kubernetes.core_api')
+    @patch('sky.provision.kubernetes.network_utils.get_ingress_settings')
+    def test_looks_up_the_configured_service(self, mock_settings, mock_api):
+        mock_settings.return_value = {
+            'class_name': 'traefik',
+            'controller_service': 'traefik',
+            'controller_namespace': 'traefik-system',
+        }
+        list_services = mock_api.return_value.list_namespaced_service
+        list_services.return_value = types.SimpleNamespace(items=[
+            _service('ingress-nginx-controller', '10.0.0.1'),
+            _service('traefik', '10.0.0.2'),
+        ])
+
+        ip, ports = network_utils.get_ingress_external_ip_and_ports('ctx')
+
+        assert (ip, ports) == ('10.0.0.2', None)
+        assert list_services.call_args.args[0] == 'traefik-system'
+
+    @patch('sky.provision.kubernetes.network_utils.kubernetes.core_api')
+    @patch('sky.provision.kubernetes.network_utils.get_ingress_settings')
+    def test_missing_service(self, mock_settings, mock_api):
+        mock_settings.return_value = {
+            'class_name': 'nginx',
+            'controller_service': 'ingress-nginx-controller',
+            'controller_namespace': 'ingress-nginx',
+        }
+        mock_api.return_value.list_namespaced_service.return_value = (
+            types.SimpleNamespace(items=[]))
+
+        assert network_utils.get_ingress_external_ip_and_ports('ctx') == (None,
+                                                                          None)

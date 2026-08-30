@@ -25,42 +25,37 @@ logger = sky_logging.init_logger(__name__)
 _INGRESS_TEMPLATE_NAME = 'kubernetes-ingress.yml.j2'
 _LOADBALANCER_TEMPLATE_NAME = 'kubernetes-loadbalancer.yml.j2'
 
-_DEFAULT_INGRESS_CLASS_NAME = 'nginx'
-_DEFAULT_INGRESS_CONTROLLER_SERVICE = 'ingress-nginx-controller'
-_DEFAULT_INGRESS_CONTROLLER_NAMESPACE = 'ingress-nginx'
-
-
-def _ingress_setting(
-        context: Optional[str],
-        key: str,
-        default: str,
-        cluster_config_overrides: Optional[Dict[str, Any]] = None) -> str:
-    context, cloud_str = kubernetes_utils.get_cleaned_context_and_cloud_str(
-        context)
-    value = skypilot_config.get_effective_region_config(
-        cloud=cloud_str,
-        region=context,
-        keys=('ingress', key),
-        default_value=default,
-        override_configs=cluster_config_overrides)
-    return default if value is None else str(value)
+# Defaults match an out-of-the-box ingress-nginx install, which is what
+# SkyPilot assumed before these were configurable.
+_DEFAULT_INGRESS_SETTINGS = {
+    'class_name': 'nginx',
+    'controller_service': 'ingress-nginx-controller',
+    'controller_namespace': 'ingress-nginx',
+}
 
 
 def get_ingress_settings(
     context: Optional[str],
     cluster_config_overrides: Optional[Dict[str,
                                             Any]] = None) -> Dict[str, str]:
-    """Ingress class and controller Service lookup, with nginx defaults."""
+    """Returns `kubernetes.ingress`, filled in with the ingress-nginx defaults.
+
+    Keys: `class_name` (the ingressClassName SkyPilot writes on the Ingress
+    objects it generates) and `controller_service` / `controller_namespace`
+    (the controller Service that endpoints are resolved from).
+    """
+    context, cloud_str = kubernetes_utils.get_cleaned_context_and_cloud_str(
+        context)
+    configured = skypilot_config.get_effective_region_config(
+        cloud=cloud_str,
+        region=context,
+        keys=('ingress',),
+        default_value={},
+        override_configs=cluster_config_overrides,
+        merge_dicts=True) or {}
     return {
-        'class_name': _ingress_setting(context, 'class_name',
-                                       _DEFAULT_INGRESS_CLASS_NAME,
-                                       cluster_config_overrides),
-        'controller_service': _ingress_setting(
-            context, 'controller_service', _DEFAULT_INGRESS_CONTROLLER_SERVICE,
-            cluster_config_overrides),
-        'controller_namespace': _ingress_setting(
-            context, 'controller_namespace',
-            _DEFAULT_INGRESS_CONTROLLER_NAMESPACE, cluster_config_overrides),
+        key: str(configured.get(key) or default)
+        for key, default in _DEFAULT_INGRESS_SETTINGS.items()
     }
 
 
@@ -270,8 +265,8 @@ def delete_namespaced_service(context: Optional[str], namespace: str,
 
 
 def ingress_controller_exists(context: Optional[str],
-                              ingress_class_name: str = 'nginx') -> bool:
-    """Checks if an ingress controller exists in the cluster."""
+                              ingress_class_name: str) -> bool:
+    """Checks if an IngressClass with this name exists in the cluster."""
     networking_api = kubernetes.networking_api(context)
     ingress_classes = networking_api.list_ingress_class(
         _request_timeout=kubernetes.API_TIMEOUT).items
@@ -281,14 +276,11 @@ def ingress_controller_exists(context: Optional[str],
 
 
 def get_ingress_external_ip_and_ports(
-    context: Optional[str],
-    namespace: Optional[str] = None,
-    service_name: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+    context: Optional[str],) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Returns external ip and ports for the ingress controller."""
     settings = get_ingress_settings(context)
-    namespace = namespace or settings['controller_namespace']
-    service_name = service_name or settings['controller_service']
+    namespace = settings['controller_namespace']
+    service_name = settings['controller_service']
     core_api = kubernetes.core_api(context)
     ingress_services = [
         item for item in core_api.list_namespaced_service(

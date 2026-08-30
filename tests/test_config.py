@@ -304,20 +304,7 @@ def test_invalid_field_config(monkeypatch, tmp_path) -> None:
     assert 'Invalid config YAML' in e.value.args[0]
 
 
-def test_kubernetes_ingress_config_accepted(monkeypatch, tmp_path) -> None:
-    config_path = tmp_path / 'ok.yaml'
-    config_path.write_text(
-        textwrap.dedent("""\
-            kubernetes:
-                ingress:
-                    class_name: traefik
-                    controller_service: traefik
-                    controller_namespace: traefik
-            """))
-    monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
-    skypilot_config.reload_config()
-    assert skypilot_config.get_nested(('kubernetes', 'ingress', 'class_name'),
-                                      None) == 'traefik'
+def test_invalid_indent_config(monkeypatch, tmp_path) -> None:
     """Test that the config is not loaded if the config file is incorrectly indented."""
     config_path = tmp_path / 'invalid.yaml'
     config_path.open('w', encoding='utf-8').write(
@@ -335,6 +322,22 @@ def test_kubernetes_ingress_config_accepted(monkeypatch, tmp_path) -> None:
     with pytest.raises(ValueError) as e:
         skypilot_config.reload_config()
     assert 'Invalid config YAML' in e.value.args[0]
+
+
+def test_kubernetes_ingress_config_accepted(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / 'ok.yaml'
+    config_path.write_text(
+        textwrap.dedent("""\
+            kubernetes:
+                ingress:
+                    class_name: traefik
+                    controller_service: traefik
+                    controller_namespace: traefik
+            """))
+    monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+    skypilot_config.reload_config()
+    assert skypilot_config.get_nested(('kubernetes', 'ingress', 'class_name'),
+                                      None) == 'traefik'
 
 
 def test_invalid_enum_config(monkeypatch, tmp_path) -> None:
