@@ -275,22 +275,40 @@ def ingress_controller_exists(context: Optional[str],
             ingress_classes))
 
 
+def get_ingress_controller_service(
+        context: Optional[str],
+        cluster_config_overrides: Optional[Dict[str,
+                                                Any]] = None) -> Optional[Any]:
+    """Returns the ingress controller Service, or None if it is not there.
+
+    None means SkyPilot cannot resolve ingress endpoints: either no ingress
+    controller is installed, or `kubernetes.ingress.controller_service` /
+    `controller_namespace` do not point at the one that is.
+    """
+    settings = get_ingress_settings(context, cluster_config_overrides)
+    core_api = kubernetes.core_api(context)
+    try:
+        services = core_api.list_namespaced_service(
+            settings['controller_namespace'],
+            _request_timeout=kubernetes.API_TIMEOUT).items
+    except kubernetes.kubernetes.client.ApiException as e:
+        if e.status == 404:
+            # The namespace itself does not exist.
+            return None
+        raise
+    for service in services:
+        if service.metadata.name == settings['controller_service']:
+            return service
+    return None
+
+
 def get_ingress_external_ip_and_ports(
     context: Optional[str],) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Returns external ip and ports for the ingress controller."""
-    settings = get_ingress_settings(context)
-    namespace = settings['controller_namespace']
-    service_name = settings['controller_service']
-    core_api = kubernetes.core_api(context)
-    ingress_services = [
-        item for item in core_api.list_namespaced_service(
-            namespace, _request_timeout=kubernetes.API_TIMEOUT).items
-        if item.metadata.name == service_name
-    ]
-    if not ingress_services:
+    ingress_service = get_ingress_controller_service(context)
+    if ingress_service is None:
         return (None, None)
 
-    ingress_service = ingress_services[0]
     if ingress_service.status.load_balancer.ingress is None:
         # We try to get an IP/host for the service in the following order:
         # 1. Try to use assigned external IP if it exists
