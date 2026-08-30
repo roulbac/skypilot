@@ -83,25 +83,15 @@ def _open_ports_using_ingress(
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
     overrides = provider_config.get('cluster_config_overrides')
     # Check if an ingress controller exists
-    if not network_utils.ingress_controller_exists(context):
+    ingress_class_name = network_utils.get_ingress_settings(
+        context, overrides)['class_name']
+    if not network_utils.ingress_controller_exists(context, ingress_class_name):
         raise Exception(
-            'Ingress controller not found. '
-            'Install Nginx ingress controller first: '
-            'https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md.'  # pylint: disable=line-too-long
-        )
-    # IngressClass can exist on clusters that never installed nginx (for
-    # example a Gateway API controller). Endpoint resolution still needs
-    # Service ingress-nginx-controller in namespace ingress-nginx.
-    if not network_utils.ingress_controller_service_exists(context):
-        raise Exception(
-            'Ingress controller Service '
-            f'"{network_utils.INGRESS_CONTROLLER_SERVICE_NAME}" not found '
-            f'in namespace "{network_utils.INGRESS_CONTROLLER_NAMESPACE}". '
-            'SkyPilot uses this Service to resolve ingress endpoints. '
-            'Install Nginx ingress, or set kubernetes.ports to a mode '
-            'that does not require it: '
-            'https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md.'  # pylint: disable=line-too-long
-        )
+            f'No IngressClass named {ingress_class_name!r} in the cluster. '
+            'Install the Nginx ingress controller '
+            '(https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md), '  # pylint: disable=line-too-long
+            'or set kubernetes.ingress.class_name to the IngressClass of the '
+            'controller you run.')
 
     # URL path namespace must match the Service's namespace (resolved above
     # from `provider_config`); per-workspace overrides can make these differ.
@@ -309,11 +299,6 @@ def _query_ports_for_ingress(
     ingress_details = network_utils.get_ingress_external_ip_and_ports(context)
     external_ip, external_ports = ingress_details
     if external_ip is None:
-        logger.warning(
-            'Ingress controller Service '
-            f'"{network_utils.INGRESS_CONTROLLER_SERVICE_NAME}" not found '
-            f'in namespace "{network_utils.INGRESS_CONTROLLER_NAMESPACE}"; '
-            'cannot resolve ingress endpoints.')
         return {}
 
     namespace = provider_config.get(
